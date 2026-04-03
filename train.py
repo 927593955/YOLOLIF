@@ -67,6 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-multi-proj-enabled", type=bool, default=True, help="Enable three parallel text-visual projections (geo/attr/sem) before similarity.")
     parser.add_argument("--text-multi-proj-score-scale", type=float, default=1.0, help="Scale factor applied after summing three projection scores.")
     parser.add_argument("--text-orth-loss-weight", type=float, default=0.05, help="Weight for orthogonality regularizer across three visual projections.")
+    parser.add_argument("--text-lora-enabled", action="store_true", help="Enable LoRA adapters on text/visual projection layers.")
+    parser.add_argument("--text-lora-rank", type=int, default=8, help="LoRA rank for text-guidance projection adapters.")
+    parser.add_argument("--text-lora-alpha", type=float, default=16.0, help="LoRA scaling alpha for projection adapters.")
+    parser.add_argument("--text-lora-dropout", type=float, default=0.0, help="Dropout ratio used before LoRA low-rank branches.")
+    parser.add_argument("--text-film-enabled", action="store_true", help="Enable FiLM modulation for feature guidance.")
+    parser.add_argument("--text-film-strength", type=float, default=0.25, help="Residual strength used by FiLM feature modulation.")
+    parser.add_argument("--text-cross-attn-enabled", action="store_true", help="Enable cross-attention from visual tokens to text tokens.")
+    parser.add_argument("--text-cross-attn-heads", type=int, default=4, help="Number of heads in text-visual cross-attention.")
+    parser.add_argument("--text-cross-attn-dim", type=int, default=128, help="Projection dim used in text-visual cross-attention.")
+    parser.add_argument("--text-cross-attn-dropout", type=float, default=0.0, help="Dropout ratio in text-visual cross-attention.")
+    parser.add_argument("--text-contrastive-loss-type", type=str, choices=("logsigmoid_margin", "infonce"), default="infonce", help="Phrase contrastive loss type.")
+    parser.add_argument("--text-infonce-temperature", type=float, default=0.25, help="Temperature for InfoNCE phrase contrastive loss.")
+    parser.add_argument("--text-hard-neg-k", type=int, default=32, help="Top-k hard negatives used in phrase contrastive loss.")
+    parser.add_argument("--text-use-in-batch-negatives", action="store_true", help="Use in-batch negatives in phrase InfoNCE loss.")
+    parser.add_argument("--text-lambda-diou", type=float, default=0.15, help="Weight for DIoU grounding loss.")
+    parser.add_argument("--text-diou-temperature", type=float, default=1.0, help="Temperature for token-to-box soft localization used by DIoU grounding.")
     parser.add_argument("--strict-match-iou", type=float, default=0.5, help="IoU threshold used by strict 1:1 grounding metrics.")
     parser.add_argument("--strict-nms-conf", type=float, default=0.25, help="Confidence threshold for strict grounding candidate boxes.")
     parser.add_argument("--strict-max-candidates-factor",type=int,default=4,help="Limit strict grounding candidates to max(descriptions, factor * gt_count).",)
@@ -128,6 +144,22 @@ def main() -> None:
             "multi_proj_enabled": bool(args.text_multi_proj_enabled),
             "multi_proj_score_scale": float(args.text_multi_proj_score_scale),
             "orth_loss_weight": float(args.text_orth_loss_weight),
+            "lora_enabled": bool(args.text_lora_enabled),
+            "lora_rank": int(args.text_lora_rank),
+            "lora_alpha": float(args.text_lora_alpha),
+            "lora_dropout": float(args.text_lora_dropout),
+            "film_enabled": bool(args.text_film_enabled),
+            "film_strength": float(args.text_film_strength),
+            "cross_attn_enabled": bool(args.text_cross_attn_enabled),
+            "cross_attn_heads": int(args.text_cross_attn_heads),
+            "cross_attn_dim": int(args.text_cross_attn_dim),
+            "cross_attn_dropout": float(args.text_cross_attn_dropout),
+            "contrastive_loss_type": str(args.text_contrastive_loss_type),
+            "infonce_temperature": float(args.text_infonce_temperature),
+            "hard_neg_k": int(args.text_hard_neg_k),
+            "use_in_batch_negatives": bool(args.text_use_in_batch_negatives),
+            "lambda_diou": float(args.text_lambda_diou),
+            "diou_temperature": float(args.text_diou_temperature),
         }
     )
     print(f"Text guidance enabled, embedding root: {embedding_root}")
@@ -149,6 +181,14 @@ def main() -> None:
         f"visual_attr={args.visual_attr_enabled}(scale={args.visual_attr_scale}), "
         f"multi_proj={args.text_multi_proj_enabled}(score_scale={args.text_multi_proj_score_scale}, "
         f"orth_w={args.text_orth_loss_weight})"
+    )
+    print(
+        "Text v2 config: "
+        f"lora={args.text_lora_enabled}(r={args.text_lora_rank},a={args.text_lora_alpha}), "
+        f"film={args.text_film_enabled}(s={args.text_film_strength}), "
+        f"cross_attn={args.text_cross_attn_enabled}(h={args.text_cross_attn_heads},d={args.text_cross_attn_dim}), "
+        f"contrastive={args.text_contrastive_loss_type}(temp={args.text_infonce_temperature},k={args.text_hard_neg_k}), "
+        f"lambda_diou={args.text_lambda_diou}"
     )
 
     train_kwargs: Dict[str, Any] = {

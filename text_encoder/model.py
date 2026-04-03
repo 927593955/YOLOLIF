@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from ultralytics.nn.modules import Detect
 from ultralytics.nn.tasks import DetectionModel
 
+from .fusion_blocks import FiLMBlock, LoRAConv2d, LoRALinear, TextCrossAttentionBlock
 from .losses import TextGuidedDetectionLoss
 
 
@@ -45,6 +46,16 @@ class TextGuidedDetectionModel(DetectionModel):
         visual_attr_eps: float = 1e-6,
         multi_proj_enabled: bool = False,
         multi_proj_score_scale: float = 1.0,
+        lora_enabled: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        film_enabled: bool = False,
+        film_strength: float = 0.25,
+        cross_attn_enabled: bool = False,
+        cross_attn_heads: int = 4,
+        cross_attn_dim: int = 128,
+        cross_attn_dropout: float = 0.0,
     ):
         self.text_enabled = bool(text_enabled)
         self.text_embed_dim = int(text_embed_dim)
@@ -81,6 +92,16 @@ class TextGuidedDetectionModel(DetectionModel):
         self.visual_attr_eps = float(max(1e-9, visual_attr_eps))
         self.multi_proj_enabled = bool(multi_proj_enabled)
         self.multi_proj_score_scale = float(max(0.0, multi_proj_score_scale))
+        self.lora_enabled = bool(lora_enabled)
+        self.lora_rank = int(max(1, lora_rank))
+        self.lora_alpha = float(max(1e-6, lora_alpha))
+        self.lora_dropout = float(max(0.0, lora_dropout))
+        self.film_enabled = bool(film_enabled)
+        self.film_strength = float(max(0.0, film_strength))
+        self.cross_attn_enabled = bool(cross_attn_enabled)
+        self.cross_attn_heads = int(max(1, cross_attn_heads))
+        self.cross_attn_dim = int(max(8, cross_attn_dim))
+        self.cross_attn_dropout = float(max(0.0, cross_attn_dropout))
         self.visual_attr_dim = 0
         if self.visual_attr_include_geom:
             # x, y, relative area
@@ -102,6 +123,8 @@ class TextGuidedDetectionModel(DetectionModel):
         self.visual_proj_geo = nn.ModuleList()
         self.visual_proj_attr = nn.ModuleList()
         self.visual_proj_sem = nn.ModuleList()
+        self.film_blocks = nn.ModuleList()
+        self.cross_attn_blocks = nn.ModuleList()
 
         self.text_seq_blocks = nn.ModuleList()
         self.text_seq_norms = nn.ModuleList()
@@ -144,19 +167,64 @@ class TextGuidedDetectionModel(DetectionModel):
         for i in range(head.nl):
             in_ch = self._infer_head_input_channels(head, i)
             proj_dim = max(32, min(256, in_ch, self.text_embed_dim))
-            self.token_proj.append(nn.Linear(self.text_embed_dim, proj_dim, bias=False))
-            self.visual_proj.append(nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False))
+            token_proj = nn.Linear(self.text_embed_dim, proj_dim, bias=False)
+            visual_proj = nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False)
+            if self.lora_enabled:
+                token_proj = LoRALinear(token_proj, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                visual_proj = LoRAConv2d(visual_proj, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+            self.token_proj.append(token_proj)
+            self.visual_proj.append(visual_proj)
+            self.film_blocks.append(FiLMBlock(in_ch))
+            self.cross_attn_blocks.append(
+                TextCrossAttentionBlock(
+                    in_channels=in_ch,
+                    text_dim=self.text_embed_dim,
+                    attn_dim=self.cross_attn_dim,
+                    num_heads=self.cross_attn_heads,
+                    dropout=self.cross_attn_dropout,
+                )
+            )
             if self.multi_proj_enabled:
-                self.token_proj_geo.append(nn.Linear(self.text_embed_dim, proj_dim, bias=False))
-                self.token_proj_attr.append(nn.Linear(self.text_embed_dim, proj_dim, bias=False))
-                self.token_proj_sem.append(nn.Linear(self.text_embed_dim, proj_dim, bias=False))
-                self.visual_proj_geo.append(nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False))
-                self.visual_proj_attr.append(nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False))
-                self.visual_proj_sem.append(nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False))
+                token_proj_geo = nn.Linear(self.text_embed_dim, proj_dim, bias=False)
+                token_proj_attr = nn.Linear(self.text_embed_dim, proj_dim, bias=False)
+                token_proj_sem = nn.Linear(self.text_embed_dim, proj_dim, bias=False)
+                visual_proj_geo = nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False)
+                visual_proj_attr = nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False)
+                visual_proj_sem = nn.Conv2d(in_ch, proj_dim, kernel_size=1, stride=1, padding=0, bias=False)
+                if self.lora_enabled:
+                    token_proj_geo = LoRALinear(token_proj_geo, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                    token_proj_attr = LoRALinear(token_proj_attr, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                    token_proj_sem = LoRALinear(token_proj_sem, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                    visual_proj_geo = LoRAConv2d(visual_proj_geo, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                    visual_proj_attr = LoRAConv2d(visual_proj_attr, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                    visual_proj_sem = LoRAConv2d(visual_proj_sem, rank=self.lora_rank, alpha=self.lora_alpha, dropout=self.lora_dropout)
+                self.token_proj_geo.append(token_proj_geo)
+                self.token_proj_attr.append(token_proj_attr)
+                self.token_proj_sem.append(token_proj_sem)
+                self.visual_proj_geo.append(visual_proj_geo)
+                self.visual_proj_attr.append(visual_proj_attr)
+                self.visual_proj_sem.append(visual_proj_sem)
             if self.visual_attr_enabled and self.visual_attr_dim > 0:
                 self.visual_attr_proj.append(
                     nn.Conv2d(self.visual_attr_dim, proj_dim, kernel_size=1, stride=1, padding=0, bias=False)
                 )
+
+    def _apply_cross_attention(
+        self,
+        feats: List[torch.Tensor],
+        txt_vec: torch.Tensor,
+        txt_token_mask: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        if not self.cross_attn_enabled:
+            return feats
+
+        out: List[torch.Tensor] = []
+        for i, feat in enumerate(feats):
+            if i >= len(self.cross_attn_blocks):
+                out.append(feat)
+                continue
+            out.append(self.cross_attn_blocks[i](feat, txt_vec, txt_token_mask))
+        return out
 
     def _enhance_text_sequence(
         self,
@@ -269,6 +337,11 @@ class TextGuidedDetectionModel(DetectionModel):
 
         return weights / denom.clamp_min(1e-6)
 
+    @staticmethod
+    def _module_dtype(module: nn.Module, fallback: torch.dtype) -> torch.dtype:
+        first = next(module.parameters(), None)
+        return first.dtype if isinstance(first, torch.Tensor) else fallback
+
     def _compute_alignment_logits(
         self,
         feats: List[torch.Tensor],
@@ -297,9 +370,9 @@ class TextGuidedDetectionModel(DetectionModel):
                 vis_attr = self._build_visual_attributes(feat)
 
             if self.multi_proj_enabled and i < len(self.token_proj_geo) and i < len(self.visual_proj_geo):
-                txt_input_geo = txt_vec.to(device=feat.device, dtype=self.token_proj_geo[i].weight.dtype)
-                txt_input_attr = txt_vec.to(device=feat.device, dtype=self.token_proj_attr[i].weight.dtype)
-                txt_input_sem = txt_vec.to(device=feat.device, dtype=self.token_proj_sem[i].weight.dtype)
+                txt_input_geo = txt_vec.to(device=feat.device, dtype=self._module_dtype(self.token_proj_geo[i], feat.dtype))
+                txt_input_attr = txt_vec.to(device=feat.device, dtype=self._module_dtype(self.token_proj_attr[i], feat.dtype))
+                txt_input_sem = txt_vec.to(device=feat.device, dtype=self._module_dtype(self.token_proj_sem[i], feat.dtype))
 
                 txt_geo = F.normalize(self.token_proj_geo[i](txt_input_geo).to(dtype=feat.dtype), dim=-1)
                 txt_attr = F.normalize(self.token_proj_attr[i](txt_input_attr).to(dtype=feat.dtype), dim=-1)
@@ -325,7 +398,7 @@ class TextGuidedDetectionModel(DetectionModel):
                 branch_visual_feats.append((vis_geo, vis_attr_map, vis_sem))
             else:
                 token_proj = self.token_proj[i]
-                txt_input = txt_vec.to(device=feat.device, dtype=token_proj.weight.dtype)
+                txt_input = txt_vec.to(device=feat.device, dtype=self._module_dtype(token_proj, feat.dtype))
                 txt_proj = token_proj(txt_input).to(dtype=feat.dtype)
                 txt_proj = F.normalize(txt_proj, dim=-1)
 
@@ -374,7 +447,11 @@ class TextGuidedDetectionModel(DetectionModel):
                 guided.append(feat)
                 continue
             gate = torch.sigmoid(alignment_logits[i]) - 0.5
-            guided.append(feat * (1.0 + self.text_guidance_strength * gate))
+            gated = feat * (1.0 + self.text_guidance_strength * gate)
+            if self.film_enabled and i < len(self.film_blocks):
+                guided.append(self.film_blocks[i](gated, alignment_logits[i], strength=self.film_strength))
+            else:
+                guided.append(gated)
         return guided
 
     def _apply_cls_logits_gating(self, raw_maps: List[torch.Tensor], alignment_logits: List[torch.Tensor], head: Detect) -> List[torch.Tensor]:
@@ -471,6 +548,7 @@ class TextGuidedDetectionModel(DetectionModel):
             return pred
 
         head_inputs = [y[j] for j in head.f]
+        head_inputs = self._apply_cross_attention(head_inputs, txt_vec, txt_token_mask)
         alignment_logits, phrase_logits, branch_visual_feats = self._compute_alignment_logits(
             head_inputs,
             txt_vec,

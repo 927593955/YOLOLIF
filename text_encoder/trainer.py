@@ -117,12 +117,28 @@ class TextGuidedDetectionTrainer(DetectionTrainer):
             visual_attr_eps=float(self.text_cfg.get("visual_attr_eps", 1e-6)),
             multi_proj_enabled=bool(self.text_cfg.get("multi_proj_enabled", False)),
             multi_proj_score_scale=float(self.text_cfg.get("multi_proj_score_scale", 1.0)),
+            lora_enabled=bool(self.text_cfg.get("lora_enabled", False)),
+            lora_rank=int(self.text_cfg.get("lora_rank", 8)),
+            lora_alpha=float(self.text_cfg.get("lora_alpha", 16.0)),
+            lora_dropout=float(self.text_cfg.get("lora_dropout", 0.0)),
+            film_enabled=bool(self.text_cfg.get("film_enabled", False)),
+            film_strength=float(self.text_cfg.get("film_strength", 0.25)),
+            cross_attn_enabled=bool(self.text_cfg.get("cross_attn_enabled", False)),
+            cross_attn_heads=int(self.text_cfg.get("cross_attn_heads", 4)),
+            cross_attn_dim=int(self.text_cfg.get("cross_attn_dim", 128)),
+            cross_attn_dropout=float(self.text_cfg.get("cross_attn_dropout", 0.0)),
         )
         model.text_lambda_heatmap = float(self.text_cfg.get("lambda_heatmap", 0.3))
         model.text_lambda_phrase = float(self.text_cfg.get("lambda_phrase", 0.2))
         model.text_lambda_set = float(self.text_cfg.get("lambda_set", 0.6))
         model.text_matching_temperature = float(self.text_cfg.get("matching_temperature", 0.7))
         model.text_orth_loss_weight = float(self.text_cfg.get("orth_loss_weight", 0.05))
+        model.text_contrastive_loss_type = str(self.text_cfg.get("contrastive_loss_type", "logsigmoid_margin"))
+        model.text_infonce_temperature = float(self.text_cfg.get("infonce_temperature", 0.25))
+        model.text_hard_neg_k = int(self.text_cfg.get("hard_neg_k", 32))
+        model.text_use_in_batch_negatives = bool(self.text_cfg.get("use_in_batch_negatives", True))
+        model.text_lambda_diou = float(self.text_cfg.get("lambda_diou", 0.15))
+        model.text_diou_temperature = float(self.text_cfg.get("diou_temperature", 1.0))
 
         if weights:
             model.load(weights)
@@ -130,7 +146,7 @@ class TextGuidedDetectionTrainer(DetectionTrainer):
 
     def get_validator(self):
         # Keep names concise so terminal headers and csv columns stay readable.
-        self.loss_names = "box", "cls", "dfl", "hm", "phr", "set", "ort", "tot"
+        self.loss_names = "box", "cls", "dfl", "hm", "phr", "set", "ort", "diou", "tot"
         return TextGuidedDetectionValidator(
             self.test_loader,
             save_dir=self.save_dir,

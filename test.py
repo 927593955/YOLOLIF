@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--imgsz", type=int, default=640, help="Validation image size.")
 	parser.add_argument("--batch", type=int, default=16, help="Validation batch size.")
 	parser.add_argument("--workers", type=int, default=0, help="Dataloader workers.")
-	parser.add_argument("--device", type=str, default="1", help="Device, e.g. '0', 'cpu'. Empty means auto.")
+	parser.add_argument("--device", type=str, default="3", help="Device, e.g. '0', 'cpu'. Empty means auto.")
 	parser.add_argument("--half", action="store_true", help="Use FP16 if device supports it.")
 	parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold for NMS.")
 	parser.add_argument("--nms-iou", type=float, default=0.7, help="IoU threshold for NMS.")

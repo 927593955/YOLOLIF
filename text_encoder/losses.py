@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from ultralytics.utils.loss import v8DetectionLoss
+from ultralytics.utils.metrics import bbox_iou
 
 from .matching import linear_sum_assignment_torch
 
@@ -21,6 +22,12 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
         self.lambda_ortho = float(getattr(model, "text_orth_loss_weight", 0.05))
         self.fuse_temperature = float(max(1e-3, getattr(model, "text_fuse_temperature", 0.5)))
         self.matching_temperature = float(max(1e-3, getattr(model, "text_matching_temperature", 0.7)))
+        self.contrastive_loss_type = str(getattr(model, "text_contrastive_loss_type", "logsigmoid_margin")).strip().lower()
+        self.infonce_temperature = float(max(1e-3, getattr(model, "text_infonce_temperature", 0.25)))
+        self.hard_neg_k = int(max(0, getattr(model, "text_hard_neg_k", 32)))
+        self.use_in_batch_negatives = bool(getattr(model, "text_use_in_batch_negatives", True))
+        self.lambda_diou = float(max(0.0, getattr(model, "text_lambda_diou", 0.15)))
+        self.diou_temperature = float(max(1e-3, getattr(model, "text_diou_temperature", 1.0)))
 
     @staticmethod
     def _compute_branch_orth_loss(branch_visual_feats: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> torch.Tensor:
@@ -224,6 +231,15 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
                 if pos.numel() <= 0 or neg.numel() <= 0:
                     continue
 
+                if self.contrastive_loss_type == "infonce":
+                    neg_pool = neg
+                    if self.hard_neg_k > 0 and int(neg_pool.numel()) > self.hard_neg_k:
+                        neg_pool = torch.topk(neg_pool, k=self.hard_neg_k, largest=True).values
+                    logits = torch.cat((pos.mean().view(1), neg_pool), dim=0) / self.infonce_temperature
+                    target = torch.zeros((1,), device=logits.device, dtype=torch.long)
+                    level_losses.append(F.cross_entropy(logits.view(1, -1), target))
+                    continue
+
                 margin = pos.mean() - neg.mean()
                 level_losses.append(-F.logsigmoid(margin))
 
@@ -330,6 +346,12 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
 
                 token_logits = phrase_flat[b, valid_tokens, :]
                 token_weights = phrase_weight[b, valid_tokens]
+                global_neg = None
+                if self.use_in_batch_negatives:
+                    other_mask = torch.ones((int(bsz),), device=pred_phrase.device, dtype=torch.bool)
+                    other_mask[b] = False
+                    if bool(other_mask.any()):
+                        global_neg = phrase_flat[other_mask].reshape(-1)
 
                 if token_target_idx is not None:
                     valid_token_indices = torch.nonzero(valid_tokens, as_tuple=False).view(-1)
@@ -345,6 +367,18 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
                             continue
 
                         token_logit = token_logits[local_j]
+                        if self.contrastive_loss_type == "infonce":
+                            pos_score = token_logit[pos_idx].mean()
+                            neg_pool = token_logit[neg_idx]
+                            if isinstance(global_neg, torch.Tensor) and int(global_neg.numel()) > 0:
+                                neg_pool = torch.cat((neg_pool, global_neg.to(device=neg_pool.device, dtype=neg_pool.dtype)), dim=0)
+                            if self.hard_neg_k > 0 and int(neg_pool.numel()) > self.hard_neg_k:
+                                neg_pool = torch.topk(neg_pool, k=self.hard_neg_k, largest=True).values
+                            logits = torch.cat((pos_score.view(1), neg_pool), dim=0) / self.infonce_temperature
+                            target = torch.zeros((1,), device=logits.device, dtype=torch.long)
+                            sample_terms.append(F.cross_entropy(logits.view(1, -1), target) * token_weights[local_j])
+                            continue
+
                         token_margin = token_logit[pos_idx].mean() - token_logit[neg_idx].mean()
                         sample_terms.append(-F.logsigmoid(token_margin) * token_weights[local_j])
 
@@ -359,6 +393,22 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
 
                 pos_score = token_logits[:, pos_idx].mean(dim=1)
                 neg_score = token_logits[:, neg_idx].mean(dim=1)
+
+                if self.contrastive_loss_type == "infonce":
+                    sample_terms: List[torch.Tensor] = []
+                    for t in range(int(token_logits.shape[0])):
+                        neg_pool = token_logits[t, neg_idx]
+                        if isinstance(global_neg, torch.Tensor) and int(global_neg.numel()) > 0:
+                            neg_pool = torch.cat((neg_pool, global_neg.to(device=neg_pool.device, dtype=neg_pool.dtype)), dim=0)
+                        if self.hard_neg_k > 0 and int(neg_pool.numel()) > self.hard_neg_k:
+                            neg_pool = torch.topk(neg_pool, k=self.hard_neg_k, largest=True).values
+                        logits = torch.cat((pos_score[t].view(1), neg_pool), dim=0) / self.infonce_temperature
+                        target = torch.zeros((1,), device=logits.device, dtype=torch.long)
+                        sample_terms.append(F.cross_entropy(logits.view(1, -1), target) * token_weights[t])
+                    if sample_terms:
+                        level_losses.append(torch.stack(sample_terms).sum())
+                    continue
+
                 token_margin = pos_score - neg_score
 
                 lse_input = token_margin / self.fuse_temperature
@@ -480,6 +530,143 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
             return torch.zeros((), device=self.device)
         return torch.stack(sample_losses).mean()
 
+    @staticmethod
+    def _build_gt_object_boxes_xyxy(batch: Dict, bsz: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_idx = batch.get("batch_idx")
+        bboxes = batch.get("bboxes")
+        if batch_idx is None or bboxes is None:
+            return torch.zeros((bsz, 1, 4), device=device), torch.zeros((bsz, 1), device=device, dtype=torch.bool)
+
+        bi = batch_idx.view(-1).to(device=device, dtype=torch.long)
+        boxes = bboxes.view(-1, 4).to(device=device, dtype=torch.float32)
+        n_targets = min(int(bi.numel()), int(boxes.shape[0]))
+        if n_targets <= 0:
+            return torch.zeros((bsz, 1, 4), device=device), torch.zeros((bsz, 1), device=device, dtype=torch.bool)
+
+        obj_count = torch.zeros((bsz,), device=device, dtype=torch.long)
+        for t in range(n_targets):
+            i = int(bi[t].item())
+            if 0 <= i < bsz:
+                obj_count[i] += 1
+        max_obj = int(obj_count.max().item()) if int(obj_count.numel()) else 0
+        if max_obj <= 0:
+            return torch.zeros((bsz, 1, 4), device=device), torch.zeros((bsz, 1), device=device, dtype=torch.bool)
+
+        out = torch.zeros((bsz, max_obj, 4), device=device, dtype=torch.float32)
+        valid = torch.zeros((bsz, max_obj), device=device, dtype=torch.bool)
+        local_idx = torch.zeros((bsz,), device=device, dtype=torch.long)
+        for t in range(n_targets):
+            i = int(bi[t].item())
+            if i < 0 or i >= bsz:
+                continue
+            j = int(local_idx[i].item())
+            local_idx[i] += 1
+            if j >= max_obj:
+                continue
+            cx, cy, bw, bh = boxes[t]
+            x1 = (cx - bw * 0.5).clamp(0.0, 1.0)
+            y1 = (cy - bh * 0.5).clamp(0.0, 1.0)
+            x2 = (cx + bw * 0.5).clamp(0.0, 1.0)
+            y2 = (cy + bh * 0.5).clamp(0.0, 1.0)
+            out[i, j] = torch.stack((x1, y1, x2, y2), dim=0)
+            valid[i, j] = True
+        return out, valid
+
+    @staticmethod
+    def _token_soft_box(token_map: torch.Tensor, h: int, w: int, temperature: float) -> torch.Tensor:
+        prob = torch.softmax(token_map.view(-1) / max(temperature, 1e-3), dim=0)
+        yy, xx = torch.meshgrid(
+            torch.linspace(0.0, 1.0, steps=h, device=token_map.device, dtype=token_map.dtype),
+            torch.linspace(0.0, 1.0, steps=w, device=token_map.device, dtype=token_map.dtype),
+            indexing="ij",
+        )
+        x = xx.reshape(-1)
+        y = yy.reshape(-1)
+        cx = (prob * x).sum()
+        cy = (prob * y).sum()
+        var_x = (prob * (x - cx).pow(2)).sum().clamp_min(1e-6)
+        var_y = (prob * (y - cy).pow(2)).sum().clamp_min(1e-6)
+        bw = (2.0 * torch.sqrt(var_x)).clamp(1.0 / max(2, w), 1.0)
+        bh = (2.0 * torch.sqrt(var_y)).clamp(1.0 / max(2, h), 1.0)
+        x1 = (cx - bw * 0.5).clamp(0.0, 1.0)
+        y1 = (cy - bh * 0.5).clamp(0.0, 1.0)
+        x2 = (cx + bw * 0.5).clamp(0.0, 1.0)
+        y2 = (cy + bh * 0.5).clamp(0.0, 1.0)
+        return torch.stack((x1, y1, x2, y2), dim=0)
+
+    def _compute_diou_grounding_loss(
+        self,
+        phrase_logits: List[torch.Tensor],
+        text_token_mask: torch.Tensor | None,
+        text_phrase_weight: torch.Tensor | None,
+        text_token_target_idx: torch.Tensor | None,
+        batch: Dict,
+    ) -> torch.Tensor:
+        if self.lambda_diou <= 0.0 or not phrase_logits:
+            return torch.zeros((), device=self.device)
+        if not isinstance(text_token_mask, torch.Tensor) or not isinstance(text_token_target_idx, torch.Tensor):
+            return torch.zeros((), device=self.device)
+
+        base = phrase_logits[0]
+        if not isinstance(base, torch.Tensor) or base.ndim != 4:
+            return torch.zeros((), device=self.device)
+
+        bsz, tokens, h, w = base.shape
+        token_mask = text_token_mask.to(device=base.device, dtype=torch.bool)
+        token_target = text_token_target_idx.to(device=base.device, dtype=torch.long)
+        if int(token_mask.shape[1]) != int(tokens):
+            tok = int(tokens)
+            if int(token_mask.shape[1]) > tok:
+                token_mask = token_mask[:, :tok]
+                token_target = token_target[:, :tok]
+            else:
+                pad_mask = torch.zeros((bsz, tok - int(token_mask.shape[1])), device=base.device, dtype=torch.bool)
+                pad_tgt = torch.full((bsz, tok - int(token_target.shape[1])), -1, device=base.device, dtype=torch.long)
+                token_mask = torch.cat((token_mask, pad_mask), dim=1)
+                token_target = torch.cat((token_target, pad_tgt), dim=1)
+
+        if isinstance(text_phrase_weight, torch.Tensor) and text_phrase_weight.ndim == 2 and int(text_phrase_weight.shape[0]) == int(bsz):
+            phrase_weight = text_phrase_weight.to(device=base.device, dtype=base.dtype)
+            if int(phrase_weight.shape[1]) != int(tokens):
+                if int(phrase_weight.shape[1]) > int(tokens):
+                    phrase_weight = phrase_weight[:, : int(tokens)]
+                else:
+                    pad = torch.ones((int(bsz), int(tokens) - int(phrase_weight.shape[1])), device=base.device, dtype=base.dtype)
+                    phrase_weight = torch.cat((phrase_weight, pad), dim=1)
+        else:
+            phrase_weight = torch.ones((int(bsz), int(tokens)), device=base.device, dtype=base.dtype)
+
+        phrase_weight = self._normalize_phrase_weights(phrase_weight, token_mask)
+        gt_boxes, gt_valid = self._build_gt_object_boxes_xyxy(batch=batch, bsz=int(bsz), device=base.device)
+        text_valid_mask = batch.get("text_valid_mask")
+
+        losses: List[torch.Tensor] = []
+        for b in range(int(bsz)):
+            if isinstance(text_valid_mask, torch.Tensor):
+                if b >= int(text_valid_mask.shape[0]) or not bool(text_valid_mask[b].item()):
+                    continue
+
+            valid_tok = torch.nonzero(token_mask[b], as_tuple=False).view(-1)
+            if int(valid_tok.numel()) <= 0:
+                continue
+
+            sample_terms: List[torch.Tensor] = []
+            for tok_idx in valid_tok.tolist():
+                obj_idx = int(token_target[b, tok_idx].item())
+                if obj_idx < 0 or obj_idx >= int(gt_boxes.shape[1]) or not bool(gt_valid[b, obj_idx].item()):
+                    continue
+                pred_box = self._token_soft_box(base[b, tok_idx], h=int(h), w=int(w), temperature=self.diou_temperature)
+                gt_box = gt_boxes[b, obj_idx]
+                diou = bbox_iou(pred_box.unsqueeze(0), gt_box.unsqueeze(0), xywh=False, DIoU=True)
+                sample_terms.append((1.0 - diou.view(-1)[0]) * phrase_weight[b, tok_idx])
+
+            if sample_terms:
+                losses.append(torch.stack(sample_terms).sum())
+
+        if not losses:
+            return torch.zeros((), device=self.device)
+        return torch.stack(losses).mean()
+
     def __call__(
         self,
         preds,
@@ -537,8 +724,16 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
             text_token_target_idx,
             batch,
         )
+        diou_loss = self._compute_diou_grounding_loss(
+            phrase_logits,
+            text_token_mask,
+            text_phrase_weight,
+            text_token_target_idx,
+            batch,
+        )
         orth_loss = self._compute_branch_orth_loss(branch_visual_feats)
         orth_loss = orth_loss.to(device=det_total.device, dtype=det_total.dtype)
+        diou_loss = diou_loss.to(device=det_total.device, dtype=det_total.dtype)
         batch_size = int(feats[0].shape[0]) if isinstance(feats, list) and feats else 1
 
         total = (
@@ -547,6 +742,7 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
             + self.lambda_phrase * phrase_loss * batch_size
             + self.lambda_set * set_loss * batch_size
             + self.lambda_ortho * orth_loss * batch_size
+            + self.lambda_diou * diou_loss * batch_size
         )
         # Report per-batch-average total to keep scale aligned with other displayed items.
         total_item = (total.detach() / float(max(batch_size, 1))).view(1)
@@ -557,6 +753,7 @@ class XRTokenAlignmentLoss(v8DetectionLoss):
                 phrase_loss.detach().view(1),
                 set_loss.detach().view(1),
                 orth_loss.detach().view(1),
+                diou_loss.detach().view(1),
                 total_item,
             ),
             dim=0,

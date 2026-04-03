@@ -48,6 +48,21 @@ DEFAULT_TEXT_GUIDANCE_CONFIG: Dict[str, Any] = {
     "multi_proj_enabled": True,
     "multi_proj_score_scale": 1.0,
     "orth_loss_weight": 0.05,
+    "lora_enabled": False,
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.0,
+    "film_enabled": True,
+    "film_strength": 0.25,
+    "cross_attn_enabled": True,
+    "cross_attn_heads": 4,
+    "cross_attn_dim": 128,
+    "cross_attn_dropout": 0.0,
+    "infonce_temperature": 0.25,
+    "hard_neg_k": 32,
+    "use_in_batch_negatives": True,
+    "lambda_diou": 0.15,
+    "diou_temperature": 1.0,
 }
 
 _TEXT_GUIDANCE_CONFIG: Dict[str, Any] = dict(DEFAULT_TEXT_GUIDANCE_CONFIG)
